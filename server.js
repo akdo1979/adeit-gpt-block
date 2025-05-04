@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { Groq } = require("groq-sdk");
+const { LlamaTokenizer } = require("llama-tokenizer-js");
 require("dotenv").config();
 
 const app = express();
@@ -16,15 +17,28 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+// Инициализация токенизатора
+const tokenizer = new LlamaTokenizer();
+
 // Память с ограничением по количеству сессий
 const conversationMemory = new Map();
 
-// Подсчёт токенов в сообщениях
-function countTokens(messages) {
-  return messages.reduce((sum, msg) => {
-    // Для упрощения подсчета, здесь можно воспользоваться грубым методом (считаем как количество символов)
-    return sum + msg.content.length; // для более точных расчётов используй токенизатор
-  }, 0);
+// Подсчёт токенов с использованием токенизатора
+async function countTokens(messages) {
+  let totalTokens = 0;
+  for (const msg of messages) {
+    const tokens = await tokenizer.encode(msg.content);
+    totalTokens += tokens.length;
+  }
+  return totalTokens;
+}
+
+// Очистка старых сессий
+function cleanupSessions() {
+  if (conversationMemory.size >= MAX_SESSIONS) {
+    const oldestSessionId = conversationMemory.keys().next().value;
+    conversationMemory.delete(oldestSessionId); // Удаляем самую старую сессию
+  }
 }
 
 app.get("/", (req, res) => {
@@ -36,11 +50,9 @@ app.post("/gpt", async (req, res) => {
 
   // Если новая сессия, создаем её
   if (!conversationMemory.has(sessionId)) {
-    if (conversationMemory.size >= MAX_SESSIONS) {
-      const oldestSessionId = conversationMemory.keys().next().value;
-      conversationMemory.delete(oldestSessionId); // Удаляем старую сессию
-    }
+    cleanupSessions(); // Очистка старых сессий
 
+    // Создание новой сессии
     conversationMemory.set(sessionId, [
       { role: "system", content: "Ты умный ассистент. Отвечай на русском языке." }
     ]);
@@ -51,11 +63,17 @@ app.post("/gpt", async (req, res) => {
   // Добавляем новое сообщение пользователя
   sessionHistory.push({ role: "user", content: message });
 
+  // Логирование текущего количества токенов перед удалением
+  console.log(`Текущие токены в сессии: ${await countTokens(sessionHistory)} / ${MAX_TOKENS_PER_SESSION} токенов`);
+
   // Удаляем старые сообщения, если токенов слишком много
-  while (countTokens(sessionHistory) > MAX_TOKENS_PER_SESSION && sessionHistory.length > 1) {
-    // Удаляем самые старые сообщения, не касаясь system prompt
-    sessionHistory.splice(1, 1);
+  while (await countTokens(sessionHistory) > MAX_TOKENS_PER_SESSION && sessionHistory.length > 1) {
+    console.log(`Удаляем старое сообщение, текущее количество сообщений: ${sessionHistory.length}`);
+    sessionHistory.shift(); // Удаляет старые сообщения (не system prompt)
   }
+
+  // Логирование после очистки старых сообщений
+  console.log(`После очистки, текущее количество токенов: ${await countTokens(sessionHistory)}`);
 
   try {
     const chatCompletion = await groq.chat.completions.create({
